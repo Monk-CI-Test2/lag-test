@@ -192,9 +192,12 @@ jobs:
                   | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
           BUCKET="${{ inputs.bucket }}"
           obj="success%2F_isolation_probe_${GITHUB_RUN_ID}.txt"
-          curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" \
-            "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${obj}" || true
-          echo "cleanup attempted (only succeeds if the token had delete rights — i.e. the insecure case)"
+          d=$(curl -s -o /dev/null -w '%{http_code}' \
+          -X DELETE \
+          -H "Authorization: Bearer $TOKEN" \
+          "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${obj}")
+
+          echo "delete probe object HTTP $d"
 
       # ------------------------------------------------------------------
       - name: "Gate — enforce the secure state"
