@@ -1,0 +1,209 @@
+name: runner-credential-isolation-test
+
+# Runs AS A TENANT JOB on a Monk CI runner VM and probes the exact thing a
+# malicious customer workflow would: can job code reach the instance metadata
+# server, lift the attached service-account token, and use it beyond its own
+# job? Then (optionally) validates that a scoped capability (signed URL) is
+# single-object + write-only as intended.
+#
+# Substitute before use:
+#   - runs-on label            -> your Monk CI / self-hosted runner label
+#   - inputs.bucket default    -> your ci-logs bucket name
+# PROJECT and ZONE are auto-discovered from the metadata server when reachable
+# (that discovery is itself part of the exposure being demonstrated).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "audit = report only | enforce = fail the run if job code can obtain a token or reach other tenants"
+        type: choice
+        default: audit
+        options: [audit, enforce]
+      bucket:
+        description: "GCS bucket to probe blast radius against"
+        type: string
+        default: dev-monkci-logs
+      signed_url:
+        description: "Optional: a pre-signed PUT URL scoped to THIS job's prefix, to validate Phase 3. Leave blank to skip."
+        type: string
+        default: ""
+
+jobs:
+  probe:
+    # >>> substitute with your Monk CI runner label <<<
+    runs-on: monkci-ubuntu-24.04-4
+    steps:
+      # ------------------------------------------------------------------
+      - name: "Phase 1 — instance metadata server reachability"
+        shell: bash
+        run: |
+          set +e
+          MDS="http://169.254.169.254/computeMetadata/v1"
+          H="Metadata-Flavor: Google"
+
+          echo "## Phase 1 — metadata server" >> "$GITHUB_STEP_SUMMARY"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "$H" --max-time 3 "$MDS/" )
+          echo "metadata root reachable: HTTP ${code:-000}"
+
+          if [ "$code" != "200" ]; then
+            echo "MDS_REACHABLE=0" >> "$GITHUB_ENV"
+            echo "- metadata server: **UNREACHABLE** (HTTP ${code:-000}) — good" >> "$GITHUB_STEP_SUMMARY"
+            echo "metadata server not reachable from job — nothing further to lift"
+            exit 0
+          fi
+          echo "MDS_REACHABLE=1" >> "$GITHUB_ENV"
+          echo "- metadata server: **REACHABLE** from job code" >> "$GITHUB_STEP_SUMMARY"
+
+          # Self-discover identity/project/zone straight out of metadata.
+          PROJECT=$(curl -s -H "$H" "$MDS/project/project-id")
+          ZONE=$(curl -s -H "$H" "$MDS/instance/zone" | awk -F/ '{print $NF}')
+          SA_LIST=$(curl -s -H "$H" "$MDS/instance/service-accounts/")
+          SA_EMAIL=$(curl -s -H "$H" "$MDS/instance/service-accounts/default/email")
+          SA_SCOPES=$(curl -s -H "$H" "$MDS/instance/service-accounts/default/scopes")
+
+          echo "project:  $PROJECT"
+          echo "zone:     $ZONE"
+          echo "attached service accounts:"; echo "$SA_LIST"
+          echo "default SA email:  $SA_EMAIL"
+          echo "default SA scopes:"; echo "$SA_SCOPES"
+
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "ZONE=$ZONE"       >> "$GITHUB_ENV"
+          {
+            echo "- attached SA: \`${SA_EMAIL:-none}\`"
+            echo "- project: \`${PROJECT:-?}\`  zone: \`${ZONE:-?}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      - name: "Phase 2 — lift token and measure blast radius"
+        if: ${{ env.MDS_REACHABLE == '1' }}
+        shell: bash
+        run: |
+          set +e
+          MDS="http://169.254.169.254/computeMetadata/v1"
+          H="Metadata-Flavor: Google"
+          BUCKET="${{ inputs.bucket }}"
+
+          echo "## Phase 2 — token blast radius" >> "$GITHUB_STEP_SUMMARY"
+
+          TOKEN=$(curl -s -H "$H" "$MDS/instance/service-accounts/default/token" \
+                  | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+          if [ -z "$TOKEN" ]; then
+            echo "no token returned"; echo "TOKEN_LIFTED=0" >> "$GITHUB_ENV"; exit 0
+          fi
+          echo "TOKEN_LIFTED=1" >> "$GITHUB_ENV"
+          echo "::warning::job code successfully lifted the attached SA access token"
+          echo "- token lifted by job code: **YES**" >> "$GITHUB_STEP_SUMMARY"
+
+          # Real granted scopes (independent of what metadata advertises).
+          echo "--- tokeninfo (authoritative scopes) ---"
+          curl -s "https://oauth2.googleapis.com/tokeninfo?access_token=$TOKEN"
+          echo
+
+          probe() { # name  expected-denied?  url
+            local name="$1"; local url="$2"
+            local c
+            c=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" --max-time 8 "$url")
+            printf '%-42s HTTP %s\n' "$name" "$c"
+            echo "$name=$c" >> /tmp/blast.txt
+          }
+
+          echo "--- blast radius probes (200 = reachable = risk) ---"
+          # See INTO the shared log bucket (other tenants' objects)?
+          probe "list ci-logs objects (cross-tenant read)" \
+            "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o?maxResults=5"
+          # Enumerate EVERY bucket in the project?
+          probe "list all buckets in project" \
+            "https://storage.googleapis.com/storage/v1/b?project=${PROJECT}"
+          # Reach entirely different APIs? (keys-to-the-kingdom check)
+          probe "list GCE instances in zone" \
+            "https://compute.googleapis.com/compute/v1/projects/${PROJECT}/zones/${ZONE}/instances"
+
+          # Attempt a WRITE outside this job's lane (into success/).
+          w=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/plain" \
+                --data "isolation-probe run ${GITHUB_RUN_ID}" --max-time 8 \
+                "https://storage.googleapis.com/upload/storage/v1/b/${BUCKET}/o?uploadType=media&name=success/_isolation_probe_${GITHUB_RUN_ID}.txt")
+          printf '%-42s HTTP %s\n' "write into success/ (wrong lane)" "$w"
+          echo "cross_lane_write=$w" >> /tmp/blast.txt
+
+          # Export the interesting verdicts for the gate.
+          grep -q "list ci-logs objects (cross-tenant read)=200" /tmp/blast.txt && echo "CROSS_TENANT_READ=1" >> "$GITHUB_ENV" || echo "CROSS_TENANT_READ=0" >> "$GITHUB_ENV"
+          grep -q "list all buckets in project=200"          /tmp/blast.txt && echo "PROJECT_WIDE=1"      >> "$GITHUB_ENV" || echo "PROJECT_WIDE=0"      >> "$GITHUB_ENV"
+          grep -q "cross_lane_write=200"                     /tmp/blast.txt && echo "CROSS_LANE_WRITE=1"  >> "$GITHUB_ENV" || echo "CROSS_LANE_WRITE=0"  >> "$GITHUB_ENV"
+
+          {
+            echo "| probe | http |"
+            echo "|---|---|"
+            sed 's/=/ | /' /tmp/blast.txt | sed 's/^/| /; s/$/ |/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      - name: "Phase 3 — validate scoped capability (signed URL)"
+        if: ${{ inputs.signed_url != '' }}
+        shell: bash
+        run: |
+          set +e
+          URL="${{ inputs.signed_url }}"
+          echo "## Phase 3 — scoped capability" >> "$GITHUB_STEP_SUMMARY"
+
+          # 3a. intended write must succeed
+          ok=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data "scoped write ${GITHUB_RUN_ID}" "$URL")
+          echo "intended PUT to signed URL:          HTTP $ok   (expect 200)"
+
+          # 3b. same signature, different object path must fail (single-object)
+          MUT="${URL/\?/x?}"   # perturb the path -> signature no longer matches
+          bad=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data x "$MUT")
+          echo "PUT to mutated object path:          HTTP $bad  (expect 403)"
+
+          # 3c. GET on a write-only URL must fail
+          rd=$(curl -s -o /dev/null -w '%{http_code}' -X GET "$URL")
+          echo "GET on the (write-only) URL:         HTTP $rd   (expect 403)"
+
+          pass=1
+          [ "$ok" = "200" ] || pass=0
+          [ "$bad" = "403" ] || { echo "::warning::scoped URL is not single-object"; pass=0; }
+          [ "$rd" = "403" ]  || { echo "::warning::scoped URL is readable, not write-only"; pass=0; }
+          echo "SCOPED_OK=$pass" >> "$GITHUB_ENV"
+          echo "- scoped capability behaves as single-object + write-only: $([ $pass = 1 ] && echo yes || echo NO)" >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      - name: "best-effort cleanup of probe objects"
+        if: ${{ always() && env.TOKEN_LIFTED == '1' }}
+        shell: bash
+        run: |
+          set +e
+          MDS="http://169.254.169.254/computeMetadata/v1"
+          TOKEN=$(curl -s -H "Metadata-Flavor: Google" "$MDS/instance/service-accounts/default/token" \
+                  | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+          BUCKET="${{ inputs.bucket }}"
+          obj="success%2F_isolation_probe_${GITHUB_RUN_ID}.txt"
+          curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" \
+            "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o/${obj}" || true
+          echo "cleanup attempted (only succeeds if the token had delete rights — i.e. the insecure case)"
+
+      # ------------------------------------------------------------------
+      - name: "Gate — enforce the secure state"
+        if: ${{ inputs.mode == 'enforce' }}
+        shell: bash
+        run: |
+          fail=0
+          if [ "${TOKEN_LIFTED:-0}" = "1" ]; then
+            echo "::error::job code obtained the VM's service-account token — credential is not off-box"
+            fail=1
+          fi
+          if [ "${CROSS_TENANT_READ:-0}" = "1" ]; then
+            echo "::error::token can read the shared ci-logs bucket — cross-tenant exposure"; fail=1
+          fi
+          if [ "${PROJECT_WIDE:-0}" = "1" ]; then
+            echo "::error::token has project-wide scope — keys to the kingdom"; fail=1
+          fi
+          if [ "${CROSS_LANE_WRITE:-0}" = "1" ]; then
+            echo "::error::job can write outside its own prefix"; fail=1
+          fi
+          if [ -n "${SCOPED_OK}" ] && [ "${SCOPED_OK}" != "1" ]; then
+            echo "::error::provided scoped capability is not single-object/write-only"; fail=1
+          fi
+          [ "$fail" = "0" ] && echo "secure state confirmed: no token liftable, no cross-tenant reach" || exit 1
