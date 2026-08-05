@@ -134,6 +134,18 @@ jobs:
           grep -q "list all buckets in project=200"          /tmp/blast.txt && echo "PROJECT_WIDE=1"      >> "$GITHUB_ENV" || echo "PROJECT_WIDE=0"      >> "$GITHUB_ENV"
           grep -q "cross_lane_write=200"                     /tmp/blast.txt && echo "CROSS_LANE_WRITE=1"  >> "$GITHUB_ENV" || echo "CROSS_LANE_WRITE=0"  >> "$GITHUB_ENV"
 
+          echo "--- sample objects visible in bucket ---"
+
+          curl -s \
+          -H "Authorization: Bearer $TOKEN" \
+          "https://storage.googleapis.com/storage/v1/b/${BUCKET}/o?maxResults=10" \
+          | tee /tmp/bucket_objects.json
+
+          echo
+          echo "--- object names ---"
+
+          grep -o '"name":"[^"]*"' /tmp/bucket_objects.json | head -20
+
           {
             echo "| probe | http |"
             echo "|---|---|"
